@@ -459,3 +459,303 @@ class DremioConnectionManager(SQLConnectionManager):
             folders = schema.split(".")
             path.extend(folders)
         return path
+
+    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Python model execution
+    # ------------------------------------------------------------------
+
+    def execute_python_job(
+        self,
+        parsed_model: dict,
+        compiled_code: str,
+        resolved_refs: Optional[Dict[str, str]] = None,
+        resolved_sources: Optional[Dict[tuple, str]] = None,
+    ) -> Tuple[int, str]:
+        """Execute a Python model client-side and persist the result via Iceberg.
+
+        Flow
+        ----
+        1. Validates that ``materialized`` is ``table`` or ``incremental``.
+        2. Validates that ``iceberg_catalog_uri`` is set in the profile.
+        3. Fetches upstream data via Arrow Flight (if configured) or REST.
+        4. Runs the user's ``model(dbt, session)`` function in-process.
+        5. Writes the resulting pandas DataFrame to Iceberg via PyIceberg
+           using the configured REST catalog.
+
+        Returns
+        -------
+        (rows_written, table_identifier)
+        """
+        try:
+            import pandas as pd  # noqa: F401
+        except ImportError as exc:
+            raise ImportError(
+                "Python models require pandas to be installed. "
+                "Run: pip install dbt-dremio[iceberg]"
+            ) from exc
+
+        from dbt.adapters.dremio.python_models.context import (
+            DbtDremioContext,
+            DremioSession,
+        )
+        from dbt.adapters.dremio.python_models.iceberg_writer import (
+            build_iceberg_writer,
+            table_identifier_from_relation,
+        )
+
+        thread_connection = self.get_thread_connection()
+        connection = self.open(thread_connection)
+        credentials = connection.credentials
+
+        config_dict = parsed_model.get("config", {})
+        materialization = config_dict.get("materialized", "table")
+        database = parsed_model.get("database", "")
+        schema = parsed_model.get("schema", "")
+        alias = parsed_model.get("alias", parsed_model.get("name", ""))
+
+        # Only table and incremental are supported for Python models
+        if materialization not in ("table", "incremental"):
+            raise dbt_common.exceptions.DbtRuntimeError(
+                f"Python model '{alias}' uses materialized='{materialization}', "
+                "which is not supported for Python models in Dremio. "
+                "Supported materializations: 'table', 'incremental'."
+            )
+
+        # Build the Iceberg (namespace, table_name) tuple
+        # iceberg_catalog_namespace in the profile overrides the schema-derived namespace
+        iceberg_namespace_override = getattr(credentials, "iceberg_catalog_namespace", None)
+        iceberg_namespace, iceberg_table_name = table_identifier_from_relation(
+            database,
+            schema,
+            alias,
+            namespace_override=iceberg_namespace_override,
+        )
+        # Human-readable for logging
+        full_table_id = ".".join(iceberg_namespace + (iceberg_table_name,)) if iceberg_namespace else iceberg_table_name
+
+        # Build the Dremio-quoted relation string for dbt.this and for ref() resolution.
+        # When iceberg_catalog_namespace is set, use it as the schema component so that
+        # ref('my_python_model') resolves to the correct Nessie path:
+        #   "nessie"."test"."my_transform_python"
+        # instead of the bare:
+        #   "nessie"."my_transform_python"
+        if iceberg_namespace_override:
+            target_relation = self._build_relation_str(database, iceberg_namespace_override, alias)
+        else:
+            target_relation = self._build_relation_str(database, schema, alias)
+
+        # ---- Validate Iceberg catalog config eagerly ----
+        # build_iceberg_writer raises DbtRuntimeError if iceberg_catalog_uri is missing
+        iceberg_writer = build_iceberg_writer(credentials)
+        iceberg_writer.connect()
+
+        # ---- Determine incremental state ----
+        # For incremental models, the table exists when it has been materialized
+        # at least once. We probe the catalog to check.
+        is_incremental = False
+        if materialization == "incremental" and not self._should_full_refresh(config_dict):
+            is_incremental = self._iceberg_table_exists(
+                iceberg_writer, iceberg_namespace, iceberg_table_name
+            )
+
+        # ---- Build ref/source mappings ----
+        refs_map = resolved_refs if resolved_refs is not None else self._build_refs_map(parsed_model)
+        sources_map = resolved_sources if resolved_sources is not None else self._build_sources_map(parsed_model)
+
+        # ---- Choose fetch transport: Arrow Flight or REST ----
+        fetch_fn, _ = self._build_fetch_fn(connection, credentials)
+
+        dbt_ctx = DbtDremioContext(
+            model_config=config_dict,
+            refs=refs_map,
+            sources=sources_map,
+            this=target_relation,
+            is_incremental=is_incremental,
+            fetch_fn=fetch_fn,
+        )
+        session = DremioSession(fetch_fn=fetch_fn)
+
+        # ---- Execute the user function ----
+        result_df = self._run_python_model(compiled_code, dbt_ctx, session)
+
+        if result_df is None:
+            raise dbt_common.exceptions.DbtRuntimeError(
+                f"Python model '{alias}' did not return a DataFrame. "
+                "The model() function must return a pandas DataFrame."
+            )
+
+        import pandas as pd
+        if not isinstance(result_df, pd.DataFrame):
+            raise dbt_common.exceptions.DbtRuntimeError(
+                f"Python model '{alias}' returned a {type(result_df).__name__} "
+                "instead of a pandas DataFrame."
+            )
+
+        rows_written = len(result_df)
+        logger.debug(
+            f"Python model '{alias}' produced {rows_written} rows. "
+            f"Writing to Iceberg table '{full_table_id}' "
+            f"(append={is_incremental})."
+        )
+
+        # ---- Write via Iceberg REST catalog ----
+        # table  → always overwrite (append=False)
+        # incremental, first run  → is_incremental=False → creates the table
+        # incremental, subsequent → is_incremental=True  → appends
+        iceberg_writer.write(
+            result_df, iceberg_namespace, iceberg_table_name, append=is_incremental
+        )
+
+        return rows_written, full_table_id
+
+    # ------------------------------------------------------------------
+    # Python model helpers
+    # ------------------------------------------------------------------
+
+    def _build_fetch_fn(self, connection, credentials):
+        """Return the best fetch function for reading upstream data into pandas.
+
+        Prefers Arrow Flight when ``flight_port`` is configured — single
+        streaming ``do_get`` call, no JSON parsing, no REST pagination.
+        Falls back to the REST API silently on any connection error.
+
+        Returns
+        -------
+        tuple[callable, DremioFlightReader | None]
+            The fetch function and the open reader (for reuse or None).
+        """
+        from dbt.adapters.dremio.python_models.flight import (
+            build_flight_reader,
+            get_flight_token,
+        )
+
+        reader = build_flight_reader(credentials)
+
+        if reader is not None:
+            try:
+                token = get_flight_token(credentials, connection.handle.get_client())
+                reader.connect(token)
+                logger.debug(
+                    f"Arrow Flight enabled (reads + DML writes) — "
+                    f"{credentials.flight_host or credentials.software_host or credentials.cloud_host}"
+                    f":{credentials.flight_port}"
+                )
+
+                def flight_fetch_fn(sql: str) -> "pd.DataFrame":
+                    return reader.fetch(sql)
+
+                return flight_fetch_fn, reader
+
+            except Exception as exc:
+                logger.warning(
+                    f"Arrow Flight connection failed ({exc}). "
+                    "Falling back to REST API."
+                )
+                try:
+                    reader.close()
+                except Exception:
+                    pass
+
+        # REST fallback
+        logger.debug("Using REST API for Python model fetch and write.")
+
+        def rest_fetch_fn(sql: str) -> "pd.DataFrame":
+            import pandas as pd
+
+            _, cursor = self.add_query(sql, fetch=True)
+            job_results = cursor.job_results()
+            rows = job_results.get("rows", [])
+            schema_info = job_results.get("schema", [])
+            columns = [col["name"] for col in schema_info]
+            return pd.DataFrame(rows, columns=columns) if rows else pd.DataFrame(columns=columns)
+
+        return rest_fetch_fn, None
+
+    @staticmethod
+    def _run_python_model(compiled_code: str, dbt_ctx, session) -> "pd.DataFrame":
+        """Compile and execute the user's Python model code, returning the DataFrame."""
+        module_globals: Dict[str, Any] = {}
+        exec(compiled_code, module_globals)  # nosec B102
+
+        model_fn = module_globals.get("model")
+        if model_fn is None or not callable(model_fn):
+            raise dbt_common.exceptions.DbtRuntimeError(
+                "Python model code must define a callable named 'model(dbt, session)'."
+            )
+        return model_fn(dbt_ctx, session)
+
+    @staticmethod
+    def _should_full_refresh(config_dict: dict) -> bool:
+        """Return True when the model config requests a full refresh.
+
+        Mirrors dbt-core's ``should_full_refresh()`` Jinja macro: a model-level
+        ``full_refresh: true`` config always wins; ``full_refresh: false`` always
+        prevents it. When absent, we default to False (i.e. respect incremental
+        semantics) — the actual ``--full-refresh`` CLI flag is already folded
+        into ``config_dict`` by dbt-core before ``submit_python_job`` is called.
+        """
+        return bool(config_dict.get("full_refresh", False))
+
+    @staticmethod
+    def _iceberg_table_exists(iceberg_writer, namespace: tuple, table_name: str) -> bool:
+        """Return True when the Iceberg table already exists in the catalog."""
+        try:
+            table_id = namespace + (table_name,) if namespace else (table_name,)
+            iceberg_writer._catalog.load_table(table_id)
+            return True
+        except Exception:
+            return False
+
+    def _build_relation_str(self, database: str, schema: str, identifier: str) -> str:
+        """Return a quoted fully-qualified relation string for Dremio."""
+        def q(s: str) -> str:
+            return f'"{s}"'
+
+        parts = [q(database)]
+        if schema and schema != "no_schema":
+            for folder in schema.split("."):
+                parts.append(q(folder))
+        parts.append(q(identifier))
+        return ".".join(parts)
+
+    def _build_refs_map(self, parsed_model: dict) -> Dict[str, str]:
+        """Build a mapping of {ref_name: quoted_relation_string} from parsed_model."""
+        refs_map: Dict[str, str] = {}
+        refs = parsed_model.get("refs", [])
+        for ref in refs:
+            # refs is a list of RefArgs-like dicts: {"name": ..., "package": ..., "version": ...}
+            if isinstance(ref, dict):
+                name = ref.get("name", "")
+            elif hasattr(ref, "name"):
+                name = ref.name
+            else:
+                name = str(ref)
+            if name:
+                # We resolve the relation at query time by passing a SELECT statement;
+                # the full catalog path is derived from depends_on_nodes if available,
+                # otherwise we quote and use the name as-is and let Dremio resolve it.
+                refs_map[name] = f'"{name}"'
+
+        # Enrich with relation_name from depends_on info if available
+        # (dbt-core populates relation_name on upstream nodes during compilation)
+        nodes = parsed_model.get("nodes", {})
+        for node_id, node_info in nodes.items():
+            if isinstance(node_info, dict):
+                node_name = node_info.get("alias") or node_info.get("name", "")
+                relation_name = node_info.get("relation_name")
+                if node_name and relation_name:
+                    refs_map[node_name] = relation_name
+
+        return refs_map
+
+    def _build_sources_map(self, parsed_model: dict) -> Dict[tuple, str]:
+        """Build a mapping of {(source_name, table_name): quoted_relation_string}."""
+        sources_map: Dict[tuple, str] = {}
+        sources = parsed_model.get("sources", [])
+        for src in sources:
+            # sources is a list of [source_name, table_name]
+            if isinstance(src, (list, tuple)) and len(src) >= 2:
+                source_name, table_name = src[0], src[1]
+                sources_map[(source_name, table_name)] = f'"{source_name}"."{table_name}"'
+        return sources_map

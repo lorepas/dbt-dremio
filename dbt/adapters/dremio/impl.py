@@ -17,14 +17,15 @@ from dbt.adapters.sql import SQLAdapter
 from dbt.adapters.dremio import DremioConnectionManager
 from dbt.adapters.dremio.column import DremioColumn
 from dbt.adapters.dremio.relation import DremioRelation
-from typing import Dict
+from typing import Dict, Type
 
 from typing import List
 from typing import Optional
 from dbt.adapters.base.column import Column as BaseColumn
-from dbt.adapters.base.impl import ConstraintSupport
+from dbt.adapters.base.impl import ConstraintSupport, PythonJobHelper
 from dbt.adapters.base.meta import available
 from dbt.adapters.base.relation import BaseRelation
+from dbt.adapters.contracts.connection import AdapterResponse, Credentials
 
 from dbt.adapters.capability import (
     CapabilityDict,
@@ -221,6 +222,147 @@ class DremioAdapter(SQLAdapter):
         self.connections.create_reflection(name, type, anchor, display, dimensions, date_dimensions, measures,
                                            computations, partition_by, partition_transform, partition_method,
                                            distribute_by, localsort_by, arrow_cache)
+
+    # ------------------------------------------------------------------
+    # Python model support
+    # ------------------------------------------------------------------
+
+    @property
+    def python_submission_helpers(self) -> Dict[str, Type[PythonJobHelper]]:
+        return {"client_side": DremioClientSideJobHelper}
+
+    @property
+    def default_python_submission_method(self) -> str:
+        return "client_side"
+
+    def generate_python_submission_response(self, submission_result) -> AdapterResponse:
+        rows, relation = submission_result
+        message = f"OK — {rows} row(s) written to {relation}"
+        return AdapterResponse(_message=message, rows_affected=rows)
+
+    def submit_python_job(self, parsed_model: dict, compiled_code: str) -> AdapterResponse:
+        """Execute a Python model client-side and materialize the result in Dremio.
+
+        dbt-core calls this method (via the ``submit_python_job`` Jinja function) when
+        the materialization macro uses ``{% call statement('main', language='python') %}``.
+
+        Resolves upstream ``ref()`` / ``source()`` relations using the adapter cache,
+        then delegates execution and Iceberg write to
+        :meth:`DremioConnectionManager.execute_python_job`.
+        """
+        # Resolve ref names → fully-qualified relation strings using the adapter's
+        # get_relation() which knows the correct database/schema/identifier.
+        # parsed_model['refs'] only contains {name, package, version} — no path info.
+        # We use the relation cache to look up each ref by name.
+        resolved_refs: Dict[str, str] = self._resolve_refs_for_python(parsed_model)
+        resolved_sources: Dict[tuple, str] = self._resolve_sources_for_python(parsed_model)
+
+        rows_written, target_relation = self.connections.execute_python_job(
+            parsed_model, compiled_code,
+            resolved_refs=resolved_refs,
+            resolved_sources=resolved_sources,
+        )
+        return self.generate_python_submission_response((rows_written, target_relation))
+
+    def _resolve_refs_for_python(self, parsed_model: dict) -> Dict[str, str]:
+        """Resolve ref names to fully-qualified Dremio relation strings.
+
+        Uses the adapter relation cache so each ref resolves to the same
+        quoted path that Dremio knows (e.g. ``"my_space"."staging"."weather"``).
+        Falls back to searching by identifier if a full match is not found.
+        """
+        resolved: Dict[str, str] = {}
+        refs = parsed_model.get("refs", [])
+        # database/schema of the *current* model — used as a search hint
+        model_database = parsed_model.get("database", "")
+        model_schema = parsed_model.get("schema", "")
+
+        for ref in refs:
+            if isinstance(ref, dict):
+                name = ref.get("name", "")
+            elif hasattr(ref, "name"):
+                name = ref.name
+            else:
+                name = str(ref)
+            if not name:
+                continue
+
+            # Try to find the relation in the cache. Start with same database/schema
+            # as the current model, then fall back to identifier-only search.
+            relation = self.get_relation(
+                database=model_database,
+                schema=model_schema,
+                identifier=name,
+            )
+            if relation is not None:
+                resolved[name] = str(relation)
+                logger.debug(f"Resolved ref '{name}' → {relation}")
+            else:
+                # Fallback: search across all cached relations by identifier name
+                relation = self._find_relation_by_identifier(name)
+                if relation is not None:
+                    resolved[name] = str(relation)
+                    logger.debug(f"Resolved ref '{name}' (fallback) → {relation}")
+                else:
+                    # Last resort: quote and hope Dremio resolves it in context
+                    resolved[name] = f'"{name}"'
+                    logger.warning(
+                        f"Could not resolve ref '{name}' to a known relation. "
+                        f"Using unqualified name — query may fail if Dremio cannot resolve it."
+                    )
+        return resolved
+
+    def _resolve_sources_for_python(self, parsed_model: dict) -> Dict[tuple, str]:
+        """Resolve source (source_name, table_name) pairs to fully-qualified relation strings."""
+        resolved: Dict[tuple, str] = {}
+        sources = parsed_model.get("sources", [])
+        for src in sources:
+            if not (isinstance(src, (list, tuple)) and len(src) >= 2):
+                continue
+            source_name, table_name = src[0], src[1]
+            # Sources typically live at the top level of the datalake
+            relation = self.get_relation(
+                database=source_name,
+                schema=None,
+                identifier=table_name,
+            ) or self._find_relation_by_identifier(table_name)
+
+            if relation is not None:
+                resolved[(source_name, table_name)] = str(relation)
+            else:
+                resolved[(source_name, table_name)] = f'"{source_name}"."{table_name}"'
+        return resolved
+
+    def _find_relation_by_identifier(self, identifier: str) -> Optional[DremioRelation]:
+        """Scan the relation cache for any relation whose identifier matches."""
+        try:
+            # RelationsCache stores wrapped entries; iterate .relations dict values
+            for wrapped in self.cache.relations.values():
+                rel = wrapped.inner if hasattr(wrapped, "inner") else wrapped
+                if rel is not None and rel.identifier == identifier:
+                    return rel
+        except Exception:
+            pass
+        return None
+
+
+class DremioClientSideJobHelper(PythonJobHelper):
+    """Satisfies the dbt-core ``PythonJobHelper`` ABC contract.
+
+    ``DremioAdapter.submit_python_job`` overrides the base-class dispatch
+    mechanism entirely and calls ``connections.execute_python_job()`` directly,
+    so this class is never instantiated at runtime. It exists only to fulfil
+    the ``python_submission_helpers`` property requirement of ``BaseAdapter``.
+    """
+
+    def __init__(self, parsed_model: dict, credentials: Credentials):
+        pass  # never instantiated in practice
+
+    def submit(self, compiled_code: str):
+        raise NotImplementedError(
+            "DremioClientSideJobHelper.submit() should never be called directly. "
+            "Execution is handled by DremioAdapter.submit_python_job()."
+        )
 
 
 COLUMNS_EQUAL_SQL = """

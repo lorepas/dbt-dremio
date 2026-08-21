@@ -12,45 +12,64 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.*/
 
-{% materialization table, adapter = 'dremio' %}
+{% materialization table, adapter = 'dremio', supported_languages=['sql', 'python'] %}
 
+  {%- set language = model['language'] -%}
   {%- set identifier = model['alias'] -%}
   {%- set branch = config.get('branch', validator=validation.any[string]) -%}
   {%- set format = config.get('format', validator=validation.any[basestring]) or 'iceberg' -%}
   {%- set old_relation = adapter.get_relation(database=database, schema=schema, identifier=identifier) -%}
   {%- set target_relation = this.incorporate(type='table') -%}
   {% set grant_config = config.get('grants') %}
+
   {{ run_hooks(pre_hooks) }}
 
-  -- create branch first if needed
-  {% if branch is not none %}
-    {{ create_branch_statement(target_relation, branch) }}
-  {% endif %}
+  {%- if language == 'python' %}
 
-  -- setup: if the target relation already exists, drop it
-  -- in case if the existing and future table is delta, we want to do a
-  -- create or replace table instead of dropping, so we don't have the table unavailable
-  {% if branch is not none %}
-    {%- set branch_relation_exists = get_relation_at_branch(database, schema, identifier, branch) -%}
-    {% if branch_relation_exists %}
-      {{ drop_relation_with_branch(target_relation, branch) }}
+    {%- if old_relation is not none -%}
+      {{ adapter.drop_relation(old_relation) }}
+    {%- endif -%}
+
+    -- Python model: execute client-side and write to Iceberg via REST catalog.
+    -- The DataFrame is written via pandas.to_iceberg() using the catalog
+    -- configured in the profile (iceberg_catalog_uri).
+    -- refresh_metadata and apply_twin_strategy are skipped because the table
+    -- is created directly by PyIceberg outside of Dremio's SQL engine.
+    {% call statement('main', language='python') -%}
+      {{ compiled_code }}
+    {%- endcall %}
+
+    {% do persist_docs(target_relation, model) %}
+    {% do apply_grants(target_relation, grant_config, should_revoke=should_revoke) %}
+
+  {%- else %}
+
+    -- SQL path (unchanged)
+    -- create branch first if needed
+    {% if branch is not none %}
+      {{ create_branch_statement(target_relation, branch) }}
     {% endif %}
-  {% elif old_relation is not none -%}
-    {{ adapter.drop_relation(old_relation) }}
+
+    -- setup: if the target relation already exists, drop it
+    {% if branch is not none %}
+      {%- set branch_relation_exists = get_relation_at_branch(database, schema, identifier, branch) -%}
+      {% if branch_relation_exists %}
+        {{ drop_relation_with_branch(target_relation, branch) }}
+      {% endif %}
+    {% elif old_relation is not none -%}
+      {{ adapter.drop_relation(old_relation) }}
+    {%- endif %}
+
+    {% call statement('main') -%}
+      {{ create_table_as(False, target_relation, external_query(sql)) }}
+    {%- endcall %}
+
+    {{ refresh_metadata(target_relation, format) }}
+    {{ apply_twin_strategy(target_relation) }}
+    {% do persist_docs(target_relation, model) %}
+    {% do apply_grants(target_relation, grant_config, should_revoke=should_revoke) %}
+
   {%- endif %}
-
-  -- build model
-  {% call statement('main') -%}
-    {{ create_table_as(False, target_relation, external_query(sql)) }}
-  {%- endcall %}
-
-  {{ refresh_metadata(target_relation, format) }}
-
-  {{ apply_twin_strategy(target_relation) }}
-
-  {% do persist_docs(target_relation, model) %}
-
-  {% do apply_grants(target_relation, grant_config, should_revoke=should_revoke) %}
 
   {{ run_hooks(post_hooks) }}
 

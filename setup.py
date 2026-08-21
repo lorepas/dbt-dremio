@@ -42,6 +42,26 @@ setup(
         "dbt-adapters>=1.16.1, <2.0",
         "requests>=2.31.0",
     ],
+    extras_require={
+        # pip install dbt-dremio[iceberg]
+        # Required for Python model support.
+        # Installs pandas, pyiceberg (for pandas.to_iceberg() writes to any
+        # Iceberg REST catalog: Nessie, Polaris, Unity, AWS Glue REST, etc.)
+        # and pyarrow (for Arrow Flight reads when flight_port is configured).
+        "iceberg": [
+            "pandas>=3.0.0",
+            "pyiceberg[pyarrow]>=0.8.0",
+            "s3fs>=2026.7.0"
+        ],
+        # pip install dbt-dremio[arrow]
+        # Enables Arrow Flight transport for Python model data fetching only
+        # (reads via do_get). Use [iceberg] instead for the full Python model
+        # stack including writes.
+        "arrow": [
+            "pandas>=1.5.0",
+            "pyarrow>=12.0.0",
+        ],
+    },
     classifiers=[
         "License :: OSI Approved :: Apache Software License",
         "Operating System :: Microsoft :: Windows",

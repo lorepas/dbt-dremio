@@ -13,8 +13,8 @@
 # limitations under the License.
 
 from dbt.adapters.contracts.connection import Credentials
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Optional, Dict
 from dbt.adapters.dremio.relation import DremioRelation
 from dbt_common.exceptions import DbtValidationError
 
@@ -32,9 +32,20 @@ class DremioCredentials(Credentials):
     cloud_project_id: Optional[str] = None
     cloud_host: Optional[str] = None
     software_host: Optional[str] = None
-    port: Optional[int] = 9047  # for rest endpoint
+    port: Optional[int] = 9047       # REST API endpoint port
+    flight_port: Optional[int] = None  # Arrow Flight endpoint port (default 32010 on Dremio)
+    flight_host: Optional[str] = None  # Arrow Flight host; defaults to software_host/cloud_host if not set
     use_ssl: Optional[bool] = True
     verify_ssl: Optional[bool] = True
+    # Iceberg REST Catalog — required for Python model materializations.
+    # Supports any Iceberg REST-compatible catalog: Nessie, Polaris, Unity, AWS Glue, etc.
+    iceberg_catalog_uri: Optional[str] = None       # e.g. "http://nessie:19120/iceberg"
+    iceberg_catalog_credential: Optional[str] = None  # "client_id:client_secret" or OAuth2 token
+    iceberg_catalog_token: Optional[str] = None      # bearer token (alternative to credential)
+    iceberg_catalog_warehouse: Optional[str] = None  # warehouse / project name
+    iceberg_catalog_name: Optional[str] = None       # logical catalog name passed to load_catalog (default: "dremio")
+    iceberg_catalog_namespace: Optional[str] = None  # explicit Iceberg namespace (default: derived from schema)
+    iceberg_catalog_properties: Optional[Dict[str, str]] = field(default=None)  # extra PyIceberg props (e.g. region, s3.endpoint, s3.access-key-id)
 
     _ALIASES = {
         # Only terms on left-side will be used going forward.
@@ -73,8 +84,13 @@ class DremioCredentials(Credentials):
             "cloud_project_id",
             "software_host",
             "port",
+            "flight_port",
+            "flight_host",
             "use_ssl",
             "environment",
+            "iceberg_catalog_uri",
+            "iceberg_catalog_warehouse",
+            "iceberg_catalog_name",
             # These are aliased...
             "UID",
             "root_path",
@@ -114,6 +130,24 @@ class DremioCredentials(Credentials):
 
         if "environment" not in data:
             data["environment"] = None
+
+        if "flight_port" not in data:
+            data["flight_port"] = None
+
+        if "flight_host" not in data:
+            data["flight_host"] = None
+
+        for key in (
+            "iceberg_catalog_uri",
+            "iceberg_catalog_credential",
+            "iceberg_catalog_token",
+            "iceberg_catalog_warehouse",
+            "iceberg_catalog_name",
+            "iceberg_catalog_namespace",
+            "iceberg_catalog_properties",
+        ):
+            if key not in data:
+                data[key] = None
 
         return data
 

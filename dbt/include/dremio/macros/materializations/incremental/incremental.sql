@@ -12,9 +12,40 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.*/
 
-{% materialization incremental, adapter='dremio' -%}
+{% materialization incremental, adapter='dremio', supported_languages=['sql', 'python'] -%}
 
-  -- relations
+  {%- set language = model['language'] -%}
+
+  {%- if language == 'python' %}
+
+    {%- set existing_relation = load_cached_relation(this) -%}
+    {%- set target_relation = this.incorporate(type='table') -%}
+    {% set grant_config = config.get('grants') %}
+
+    {{ run_hooks(pre_hooks, inside_transaction=False) }}
+    {{ run_hooks(pre_hooks, inside_transaction=True) }}
+
+    -- Python incremental model: execute client-side via submit_python_job.
+    -- The model() function receives dbt.is_incremental=True on subsequent runs
+    -- and is responsible for filtering upstream data accordingly.
+    -- PyIceberg handles the append vs overwrite semantics via to_iceberg().
+    {% call statement('main', language='python') -%}
+      {{ compiled_code }}
+    {%- endcall %}
+
+    {% set should_revoke = should_revoke(existing_relation, full_refresh_mode=should_full_refresh()) %}
+    {% do apply_grants(target_relation, grant_config, should_revoke=should_revoke) %}
+    {% do persist_docs(target_relation, model) %}
+
+    {{ run_hooks(post_hooks, inside_transaction=True) }}
+    {% do adapter.commit() %}
+    {{ run_hooks(post_hooks, inside_transaction=False) }}
+
+    {{ return({'relations': [target_relation]}) }}
+
+  {%- endif %}
+
+  -- SQL incremental path
   {%- set existing_relation = load_cached_relation(this) -%} 
   {%- set target_relation = this.incorporate(type='table') -%}
   {%- set temp_relation = make_temp_relation(target_relation) -%}
@@ -27,6 +58,7 @@ limitations under the License.*/
   {%- set full_refresh_mode = (should_full_refresh()) -%}
   {%- set raw_on_schema_change = config.get('on_schema_change', validator=validation.any[basestring]) or 'ignore' -%}
   {%- set on_schema_change = incremental_validate_on_schema_change(raw_on_schema_change) -%}
+  {%- set raw_file_format = config.get('format', validator=validation.any[basestring]) or 'iceberg' -%}
 
   -- the temp_ and backup_ relations should not already exist in the database; get_relation
   -- will return None in that case. Otherwise, we get a relation that we can drop
@@ -67,7 +99,6 @@ limitations under the License.*/
 
     -- Get the incremental_strategy, the macro to use for the strategy, and build the sql
     {%- set incremental_strategy = config.get('incremental_strategy', validator=validation.any[basestring]) or 'append' -%}
-    {%- set raw_file_format = config.get('format', validator=validation.any[basestring]) or 'iceberg' -%}
     {%- set file_format = dbt_dremio_validate_get_file_format(raw_file_format) -%}
     {%- set incremental_predicates = config.get('predicates', none) or config.get('incremental_predicates', none) -%}
     {%- set strategy = dbt_dremio_validate_get_incremental_strategy(incremental_strategy) -%}
